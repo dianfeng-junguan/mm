@@ -63,10 +63,12 @@ struct slab* create_slab(struct slab_cache* cache)
 
 void* alloc_memory_block(struct slab* slab, struct slab_cache* cache)
 {
-    if (slab->active >= slab->freelist[0] + slab->freelist[1]) {
-        // slab is full
+    // The slab is full, cannot allocate.
+    if (slab->active >= cache->objects_num_per_slab) {
         return NULPTR;
     }
+    // Get the index of the next free object from the freelist.
+    // The freelist is used as a stack, 'active' points to the top.
     short index = slab->freelist[slab->active];
     slab->active++;
     size_t aligned_object_size = ALIGN_UP(cache->object_size, cache->alignment);
@@ -81,8 +83,11 @@ void free_memory_block(struct slab* slab, struct slab_cache* cache, void* ptr)
 {
     size_t aligned_object_size = ALIGN_UP(cache->object_size, cache->alignment);
     short index = (short)(((unsigned long long)ptr - (unsigned long long)slab->mem_ptr) / aligned_object_size);
+
+    // Push the freed index back onto the freelist stack.
     slab->active--;
     slab->freelist[slab->active] = index;
+
     if (cache->dtor) {
         cache->dtor(ptr, cache->object_size);
     }
@@ -93,63 +98,105 @@ void* slab_alloc(size_t size, size_t alignment, struct slab_cache* cache_array, 
     //find a suitable slab cache
     struct slab_cache* target_cache = (struct slab_cache*)NULPTR;
     for (size_t i = 0; i < cache_array_size; i++) {
+        // Find the first cache that is large enough. Assumes cache_array is sorted by size.
         if (cache_array[i].object_size >= size && cache_array[i].alignment >= alignment) {
             target_cache = &cache_array[i];
             break;
         }
     }
     if (target_cache == NULPTR) {
+        // No suitable cache found. In a real system, you might create a new cache
+        // or fallback to a different allocator. Here we just fail.
         return NULPTR;
     }
-    //try to find a partial slab first
-    struct slab* target_slab = target_cache->slabs_partial;
-    if (target_slab == NULPTR) {
-        //try to find an empty slab
+
+    struct slab* target_slab = (struct slab*)NULPTR;
+
+    // 1. Try to use a partially full slab first.
+    if (target_cache->slabs_partial) {
+        target_slab = target_cache->slabs_partial;
+    }
+    // 2. If no partial slabs, try to use an empty slab.
+    else if (target_cache->slabs_empty) {
         target_slab = target_cache->slabs_empty;
+        // This slab was empty, now it will be partial. Move it.
+        PTRLIST_DROP(target_slab);
+        target_cache->slabs_empty = target_slab->next;
+        PTRLIST_INSERT(&target_cache->slabs_partial, target_slab);
+    }
+    // 3. If no partial and no empty slabs, create a new one.
+    else {
+        target_slab = create_slab(target_cache);
         if (target_slab == NULPTR) {
-            //create a new slab
-            target_slab = create_slab(target_cache);
-            if (target_slab == NULPTR) {
-                return NULPTR;
-            }
-            //insert the new slab into the partial list, because we are going to allocate from it
-            PTRLIST_INSERT(&target_cache->slabs_partial, target_slab);
-        } else {
-            //move the slab from partial to full if needed
-            if (target_slab->active == (int)(target_cache->objects_num_per_slab - 1)) {
-                PTRLIST_DROP(target_slab);
-                PTRLIST_INSERT(&target_cache->slabs_full, target_slab);
-            }
+            return NULPTR; // Out of memory
         }
+        // The new slab is immediately partial because we are about to allocate from it.
+        PTRLIST_INSERT(&target_cache->slabs_partial, target_slab);
     }
 
     void* block_ptr = alloc_memory_block(target_slab, target_cache);
+
+    // After allocation, check if the slab has become full.
+    if (target_slab->active == target_cache->objects_num_per_slab) {
+        PTRLIST_DROP(target_slab);
+        target_cache->slabs_partial = target_slab->next;
+        PTRLIST_INSERT(&target_cache->slabs_full, target_slab);
+    }
+
     return block_ptr;
 }
 
 void slab_free(void* ptr, struct slab_cache* cache_array, size_t cache_array_size)
 {
-    //find which slab this ptr belongs to
+    // A simple, but inefficient way to find the slab.
+    // A better way is to store a pointer to the slab or cache in the object's metadata
+    // or use page alignment tricks to find the slab metadata.
     for (size_t i = 0; i < cache_array_size; i++) {
         struct slab_cache* cache = &cache_array[i];
-        //search in partial slabs
+        size_t aligned_object_size = ALIGN_UP(cache->object_size, cache->alignment);
+        size_t objects_total_size = aligned_object_size * cache->objects_num_per_slab;
+
+        // --- Search in partial slabs ---
         struct slab* slab = cache->slabs_partial;
         while (slab) {
-            unsigned long long slab_start = (unsigned long long)slab;
-            unsigned long long slab_end = slab_start + SLAB_SIZE;
-            if ((unsigned long long)ptr >= slab_start && (unsigned long long)ptr < slab_end) {
+            unsigned long long objects_start = (unsigned long long)slab->mem_ptr;
+            unsigned long long objects_end = objects_start + objects_total_size;
+            if ((unsigned long long)ptr >= objects_start && (unsigned long long)ptr < objects_end) {
+                int active_before = slab->active;
                 free_memory_block(slab, cache, ptr);
+                // If the slab was full and now has a free spot, move it to partial.
+                // (This case is handled below, as it must have been in the full list before)
+
+                // If the slab is now completely empty, move it to the empty list.
+                if (slab->active == 0) {
+                    PTRLIST_DROP(slab);
+                    LOG("[LOG] slab moved to empty\n");
+                    if (cache->slabs_partial == slab) {
+                        cache->slabs_partial = slab->next;
+                    }
+                    PTRLIST_INSERT(&cache->slabs_empty, slab);
+                }
                 return;
             }
             slab = PTRLIST_NEXT(slab);
         }
-        //search in full slabs
+
+        // --- Search in full slabs ---
         slab = cache->slabs_full;
         while (slab) {
-            unsigned long long slab_start = (unsigned long long)slab;
-            unsigned long long slab_end = slab_start + SLAB_SIZE;
-            if ((unsigned long long)ptr >= slab_start && (unsigned long long)ptr < slab_end) {
+            unsigned long long objects_start = (unsigned long long)slab->mem_ptr;
+            unsigned long long objects_end = objects_start + objects_total_size;
+            if ((unsigned long long)ptr >= objects_start && (unsigned long long)ptr < objects_end) {
+                int active_before = slab->active;
                 free_memory_block(slab, cache, ptr);
+                // If the slab was full and now has a free spot, move it to partial.
+                if (active_before == cache->objects_num_per_slab) {
+                    PTRLIST_DROP(slab);
+                    if (cache->slabs_full == slab) {
+                        cache->slabs_full = slab->next;
+                    }
+                    PTRLIST_INSERT(&cache->slabs_partial, slab);
+                }
                 return;
             }
             slab = PTRLIST_NEXT(slab);
