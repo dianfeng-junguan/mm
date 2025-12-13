@@ -1,0 +1,9 @@
+.vscode
+
+build
+
+log
+
+out
+
+CMakePresets.json
